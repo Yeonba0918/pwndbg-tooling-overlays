@@ -1,0 +1,89 @@
+#!/bin/bash
+set -euo pipefail
+
+dir="$(cd -- "$(dirname "$(dirname "$(realpath "$0")")")" >/dev/null 2>&1 ; pwd -P)"
+if [[ ! -x "$dir/exe/gdb" && -x /usr/local/lib/pwndbg-gdb/exe/gdb ]]; then
+    dir="/usr/local/lib/pwndbg-gdb"
+fi
+export TERMINFO_DIRS=/etc/terminfo:/lib/terminfo:/usr/share/terminfo:/run/current-system/sw/share/terminfo:$dir/share/terminfo
+export PYTHONNOUSERSITE=1
+export PYTHONHOME="$dir"
+export PYTHONPATH=""
+export PATH="$dir/bin/:$PATH"
+
+pid=""
+pid_pending=0
+expect_value=0
+explicit_file=0
+passthrough=()
+
+for arg in "$@"; do
+    if [[ $pid_pending -eq 1 ]]; then
+        pid="$arg"
+        pid_pending=0
+        continue
+    fi
+
+    if [[ $expect_value -eq 1 ]]; then
+        passthrough+=("$arg")
+        expect_value=0
+        continue
+    fi
+
+    case "$arg" in
+        -p|--pid)
+            pid_pending=1
+            continue
+            ;;
+        -p[0-9]*)
+            pid="${arg#-p}"
+            continue
+            ;;
+        -pid=*|--pid=*)
+            pid="${arg#*=}"
+            continue
+            ;;
+        -ex|-iex|-ix|-x|--eval-command|--early-init-eval-command|--init-command|--command|--directory|--cd|--symbols|--se)
+            passthrough+=("$arg")
+            expect_value=1
+            continue
+            ;;
+        --args)
+            explicit_file=1
+            passthrough+=("$arg")
+            continue
+            ;;
+    esac
+
+    if [[ "$arg" != -* ]]; then
+        explicit_file=1
+    fi
+    passthrough+=("$arg")
+done
+
+gdb_bin="$dir/exe/gdb"
+gdbinit_py="$dir/exe/gdbinit.py"
+ldso="$dir/lib/ld-linux-x86-64.so.2"
+
+if [[ -n "$pid" && "$explicit_file" -eq 0 ]]; then
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    sysroot="/proc/$pid/root"
+    if [[ -n "$exe" && -e "$sysroot$exe" ]]; then
+        exe_dir="$(dirname "$exe")"
+        solib_search_path="$sysroot$exe_dir:$sysroot/lib:$sysroot/lib64:$sysroot/usr/lib:$sysroot/usr/lib64:$sysroot/usr/local/lib:$sysroot/lib/x86_64-linux-gnu:$sysroot/usr/lib/x86_64-linux-gnu"
+        libthread_db_search_path="\$sdir:\$pdir:$sysroot/lib/x86_64-linux-gnu:$sysroot/usr/lib/x86_64-linux-gnu"
+        debug_file_directory="/usr/lib/debug:$sysroot/usr/lib/debug"
+
+        exec "$ldso" "$gdb_bin" --quiet --early-init-eval-command="set auto-load safe-path /" \
+            --command="$gdbinit_py" \
+            "$sysroot$exe" \
+            -ex "set sysroot $sysroot" \
+            -ex "set solib-search-path $solib_search_path" \
+            -ex "set libthread-db-search-path $libthread_db_search_path" \
+            -ex "set debug-file-directory $debug_file_directory" \
+            -ex "attach $pid" \
+            "${passthrough[@]}"
+    fi
+fi
+
+exec "$ldso" "$gdb_bin" --quiet --early-init-eval-command="set auto-load safe-path /" --command="$gdbinit_py" "${passthrough[@]}"
