@@ -6,6 +6,8 @@ import os
 import sys
 import types
 from collections import OrderedDict
+from dataclasses import dataclass
+from dataclasses import field
 
 if sys.version_info >= (3, 11):
     # Python 3.11, see https://docs.python.org/3/whatsnew/3.11.html#enum
@@ -162,6 +164,72 @@ class Bins:
             return self.bins[size].contains_chunk(chunk)
 
         return False
+
+
+@dataclass(frozen=True)
+class HeapBinSnapshot:
+    key: str
+    fd_chain: tuple[int, ...]
+    bk_chain: tuple[int, ...] | None
+    count: int | None
+    is_corrupted: bool
+
+
+@dataclass(frozen=True)
+class HeapChunkSnapshot:
+    address: int
+    size: int
+    real_size: int
+    prev_inuse: bool | None
+    is_mmapped: bool | None
+    non_main_arena: bool | None
+    fd: int | None
+    bk: int | None
+    is_top_chunk: bool
+
+
+@dataclass(frozen=True)
+class HeapStateSnapshot:
+    name: str
+    allocator_type: str
+    arena_addr: int | None
+    thread_arena_addr: int | None
+    main_arena_addr: int | None
+    tcache_addr: int | None
+    mp_addr: int | None
+    global_max_fast_addr: int | None
+    global_max_fast: int | None
+    chunk_count: int
+    chunks: tuple[HeapChunkSnapshot, ...]
+    bins: dict[str, tuple[HeapBinSnapshot, ...]]
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class HeapBinDelta:
+    bin_type: str
+    key: str
+    before: HeapBinSnapshot | None
+    after: HeapBinSnapshot | None
+
+
+@dataclass(frozen=True)
+class HeapChunkDelta:
+    address: int
+    before: HeapChunkSnapshot | None
+    after: HeapChunkSnapshot | None
+
+
+@dataclass(frozen=True)
+class HeapStateDiff:
+    before_name: str
+    after_name: str
+    changed_fields: dict[str, tuple[object, object]]
+    chunk_deltas: tuple[HeapChunkDelta, ...]
+    bin_deltas: tuple[HeapBinDelta, ...]
+
+
+HEAP_SNAPSHOTS: OrderedDict[str, HeapStateSnapshot] = OrderedDict()
 
 
 def heap_for_ptr(ptr: int) -> int:
@@ -1589,6 +1657,157 @@ def populate_global_heap_configs_from_allocator(
         address = address_getter(value)
         if address:
             config.value = hex(int(address))
+
+
+def capture_bin_snapshot(bins: Bins | None) -> tuple[HeapBinSnapshot, ...]:
+    if bins is None:
+        return ()
+
+    snapshots: list[HeapBinSnapshot] = []
+    for key, entry in bins.bins.items():
+        snapshots.append(
+            HeapBinSnapshot(
+                key=str(key),
+                fd_chain=tuple(entry.fd_chain),
+                bk_chain=tuple(entry.bk_chain) if entry.bk_chain is not None else None,
+                count=entry.count,
+                is_corrupted=entry.is_corrupted,
+            )
+        )
+    return tuple(snapshots)
+
+
+def capture_chunk_snapshot(chunk: Chunk) -> HeapChunkSnapshot:
+    def _maybe_int(value):
+        return None if value is None else int(value)
+
+    return HeapChunkSnapshot(
+        address=chunk.address,
+        size=chunk.size,
+        real_size=chunk.real_size,
+        prev_inuse=chunk.prev_inuse,
+        is_mmapped=chunk.is_mmapped,
+        non_main_arena=chunk.non_main_arena,
+        fd=_maybe_int(chunk.fd),
+        bk=_maybe_int(chunk.bk),
+        is_top_chunk=chunk.is_top_chunk,
+    )
+
+
+def capture_heap_state_snapshot(
+    name: str,
+    allocator: GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Value]
+    | GlibcMemoryAllocator[
+        type["pwndbg.aglib.heap.structs.CStruct2GDB"], "pwndbg.aglib.heap.structs.CStruct2GDB"
+    ],
+    *,
+    arena_addr: int | None = None,
+    tcache_addr: int | None = None,
+    max_chunks: int | None = None,
+) -> HeapStateSnapshot:
+    arena = Arena(arena_addr) if arena_addr is not None else allocator.thread_arena
+    if arena is None:
+        raise ValueError("No arena available for snapshot")
+
+    chunks: list[HeapChunkSnapshot] = []
+    notes: list[str] = []
+    for idx, chunk in enumerate(arena.active_heap):
+        if max_chunks is not None and idx >= max_chunks:
+            notes.append(f"chunk capture truncated at {max_chunks}")
+            break
+        chunks.append(capture_chunk_snapshot(chunk))
+
+    bins = {
+        BinType.TCACHE.value: capture_bin_snapshot(allocator.tcachebins(tcache_addr)),
+        BinType.FAST.value: capture_bin_snapshot(allocator.fastbins(arena.address)),
+        BinType.UNSORTED.value: capture_bin_snapshot(allocator.unsortedbin(arena.address)),
+        BinType.SMALL.value: capture_bin_snapshot(allocator.smallbins(arena.address)),
+        BinType.LARGE.value: capture_bin_snapshot(allocator.largebins(arena.address)),
+    }
+
+    thread_arena = allocator.thread_arena
+    main_arena = allocator.main_arena
+    try:
+        thread_cache = allocator.get_tcache(tcache_addr)
+        tcache_value = int(thread_cache.address) if thread_cache is not None else None
+    except Exception:
+        tcache_value = None
+
+    return HeapStateSnapshot(
+        name=name,
+        allocator_type=type(allocator).__name__,
+        arena_addr=arena.address,
+        thread_arena_addr=thread_arena.address if thread_arena is not None else None,
+        main_arena_addr=main_arena.address if main_arena is not None else None,
+        tcache_addr=tcache_value,
+        mp_addr=getattr(allocator, "_mp_addr", None),
+        global_max_fast_addr=getattr(allocator, "_global_max_fast_addr", None),
+        global_max_fast=allocator.global_max_fast,
+        chunk_count=len(chunks),
+        chunks=tuple(chunks),
+        bins=bins,
+        notes=tuple(notes),
+    )
+
+
+def store_heap_snapshot(snapshot: HeapStateSnapshot) -> None:
+    if snapshot.name in HEAP_SNAPSHOTS:
+        del HEAP_SNAPSHOTS[snapshot.name]
+    HEAP_SNAPSHOTS[snapshot.name] = snapshot
+
+
+def list_heap_snapshots() -> tuple[str, ...]:
+    return tuple(HEAP_SNAPSHOTS.keys())
+
+
+def get_heap_snapshot(name: str) -> HeapStateSnapshot | None:
+    return HEAP_SNAPSHOTS.get(name)
+
+
+def diff_heap_snapshots(before: HeapStateSnapshot, after: HeapStateSnapshot) -> HeapStateDiff:
+    changed_fields: dict[str, tuple[int | None, int | None]] = {}
+    for field_name in (
+        "allocator_type",
+        "arena_addr",
+        "thread_arena_addr",
+        "main_arena_addr",
+        "tcache_addr",
+        "mp_addr",
+        "global_max_fast_addr",
+        "global_max_fast",
+    ):
+        before_value = getattr(before, field_name)
+        after_value = getattr(after, field_name)
+        if before_value != after_value:
+            changed_fields[field_name] = (before_value, after_value)
+
+    before_chunks = {chunk.address: chunk for chunk in before.chunks}
+    after_chunks = {chunk.address: chunk for chunk in after.chunks}
+    all_chunk_addrs = sorted(set(before_chunks) | set(after_chunks))
+    chunk_deltas: list[HeapChunkDelta] = []
+    for address in all_chunk_addrs:
+        old = before_chunks.get(address)
+        new = after_chunks.get(address)
+        if old != new:
+            chunk_deltas.append(HeapChunkDelta(address=address, before=old, after=new))
+
+    bin_deltas: list[HeapBinDelta] = []
+    for bin_type in sorted(set(before.bins) | set(after.bins)):
+        old_bins = {entry.key: entry for entry in before.bins.get(bin_type, ())}
+        new_bins = {entry.key: entry for entry in after.bins.get(bin_type, ())}
+        for key in sorted(set(old_bins) | set(new_bins)):
+            old = old_bins.get(key)
+            new = new_bins.get(key)
+            if old != new:
+                bin_deltas.append(HeapBinDelta(bin_type=bin_type, key=key, before=old, after=new))
+
+    return HeapStateDiff(
+        before_name=before.name,
+        after_name=after.name,
+        changed_fields=changed_fields,
+        chunk_deltas=tuple(chunk_deltas),
+        bin_deltas=tuple(bin_deltas),
+    )
 
 
 class DebugSymsHeap(GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Value]):

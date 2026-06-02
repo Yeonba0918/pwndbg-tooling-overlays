@@ -2,10 +2,11 @@
 
 `pwndbg`를 그대로 포크해서 전체 코드를 보여주기보다, 실제로 내가 추가한 디버깅 워크플로우 개선만 분리한 프로젝트다.
 
-이 프로젝트는 두 가지 실제 불편함에서 시작했다.
+이 프로젝트는 세 가지 실제 불편함에서 시작했다.
 
 - Docker / PID namespace 환경에서 `attach pwndbg chall` 또는 `pwndbg -p <pid>`로 붙으면 `heap` 분석이 자주 깨졌다.
 - QEMU Linux kernel 디버깅에서는 `vmmap` 계산 비용 때문에 stop 이후 응답이 느려지는 경우가 있었다.
+- exploit 단계 사이에서 `heap`, `bins`, `malloc-chunk` 결과를 손으로 비교하는 과정이 번거로웠다.
 
 ## What This Project Solves
 
@@ -37,6 +38,18 @@ QEMU kernel debugging에서는 `kernel vmmap` 재계산이 stop마다 반복되�
 - `kcurrent --set`으로 task-specific PGD가 바뀌면 캐시 자동 무효화
 
 즉, 정확도를 유지하면서도 page table / monitor 기반 vmmap 재계산 비용을 줄이는 방향이다.
+
+### 3. Heap snapshot / diff workflow
+
+힙 익스플로잇을 진행할 때는 “한 단계 전과 지금이 어떻게 달라졌는지”를 빠르게 보는 게 중요하다.
+
+이 프로젝트는 이를 위해 다음 흐름을 추가한다.
+
+- `heap-snapshot [name]`
+- `heap-snapshots`
+- `heap-diff [before] [after]`
+
+스냅샷에는 현재 arena 기준 chunk 상태와 bin 체인이 저장되고, diff에서는 메타데이터 변화, chunk 추가/삭제/필드 변경, bin 체인 변화를 요약해 보여준다.
 
 ## Repository Structure
 

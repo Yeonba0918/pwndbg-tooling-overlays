@@ -173,6 +173,30 @@ async def test_heap_command_uses_stock_chunk_printer(ctrl: Controller) -> None:
 
 
 @pwndbg_test
+async def test_heap_snapshot_and_diff(ctrl: Controller) -> None:
+    await launch_to(ctrl, HEAP_MALLOC_CHUNK, "break_here")
+
+    snapshot1 = await ctrl.execute_and_capture("heap-snapshot main-thread")
+    assert "Stored heap snapshot 'main-thread'" in snapshot1
+
+    await ctrl.cont()
+    await ctrl.cont()
+
+    snapshot2 = await ctrl.execute_and_capture("heap-snapshot worker-thread")
+    assert "Stored heap snapshot 'worker-thread'" in snapshot2
+
+    snapshots_output = await ctrl.execute_and_capture("heap-snapshots")
+    assert "main-thread" in snapshots_output
+    assert "worker-thread" in snapshots_output
+
+    diff_output = await ctrl.execute_and_capture(
+        "heap-diff main-thread worker-thread --max-chunks 5 --max-bins 5"
+    )
+    assert "heap diff: main-thread -> worker-thread" in diff_output
+    assert "chunks" in diff_output or "bins" in diff_output or "metadata" in diff_output
+
+
+@pwndbg_test
 async def test_heap_command_range_and_count(ctrl: Controller) -> None:
     import pwndbg.aglib
     import pwndbg.aglib.symbol
